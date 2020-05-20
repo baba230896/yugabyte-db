@@ -134,7 +134,13 @@ worker2   -        virtualbox   Running   tcp://192.168.99.101:2376           v1
 worker3   -        virtualbox   Running   tcp://192.168.99.102:2376           v18.05.0-ce
 ```
 
-## 2. Create overlay network
+## 2. Deploy YugabyteDB
+
+- This can be done in two ways.
+
+### Way 1: Using `docker service`
+
+#### Create overlay network
 
 - SSH into the worker1 node where the swarm manager is running.
 
@@ -148,7 +154,7 @@ $ docker-machine ssh worker1
 $ docker network create --driver overlay --attachable yugabytedb
 ```
 
-## 3. Create yb-master services
+#### Create yb-master services
 
 - Create 3 YB-Master [`replicated`](https://docs.docker.com/engine/swarm/how-swarm-mode-works/services/) services each with replicas set to 1. This is the [only way](https://github.com/moby/moby/issues/30963) in Docker Swarm today to get stable network identities for each of the YB-Master containers that we will need to provide as input for creating the YB-TServer service in the next step.
 
@@ -213,7 +219,7 @@ ah6wfodd4noh        yb-master3          replicated          1/1                 
 
 - View the yb-master Admin UI by going to the port 7000 of any node, courtesy of the publish option used when yb-master1 was created. For example, we can see from Step 1 that worker2's IP address is `192.168.99.101`. So, `http://192.168.99.101:7000` takes us to the yb-master Admin UI.
 
-## 4. Create yb-tserver service
+#### Create yb-tserver service
 
 - Create a single yb-tserver [`global`](https://docs.docker.com/engine/swarm/how-swarm-mode-works/services/) service so that swarm can then automatically spawn 1 container/task on each worker node. Each time we add a node to the swarm, the swarm orchestrator creates a task and the scheduler assigns the task to the new node.
 
@@ -254,7 +260,112 @@ n6padh2oqjk7        yb-tserver          global              3/3                 
 
 - Now we can go to `http://192.168.99.101:9000` to see the yb-tserver admin UI.
 
-## 5. Test the APIs
+
+### Way 2: Using `docker stack`
+
+- SSH into the worker1 node where the swarm manager is running.
+
+```sh
+$ docker-machine ssh worker1
+```
+
+#### Create a `docker-stack.yaml` file
+
+```sh
+version: '3.6'
+
+networks:
+  yugabytedb:
+    driver: overlay
+    attachable: true
+
+services:
+  yb-master1:
+    image: yugabytedb/yugabyte:latest
+    command:
+    - "/home/yugabyte/bin/yb-master"
+    - "--fs_data_dirs=/mnt/data0"
+    - "--master_addresses=tasks.yb-master1:7100,tasks.yb-master2:7100,tasks.yb-master3:7100"
+    - "--rpc_bind_addresses=0.0.0.0:7100"
+    - "--replication_factor=3"
+    ports:
+    - 7000:7000
+    networks:
+    - yugabytedb
+    volumes:
+    - yb-master1:/mnt/data0/
+
+  yb-master2:
+    image: yugabytedb/yugabyte:latest
+    command:
+    - "/home/yugabyte/bin/yb-master"
+    - "--fs_data_dirs=/mnt/data0"
+    - "--master_addresses=tasks.yb-master1:7100,tasks.yb-master2:7100,tasks.yb-master3:7100"
+    - "--rpc_bind_addresses=0.0.0.0:7100"
+    - "--replication_factor=3"
+    networks:
+    - yugabytedb
+    volumes:
+    - yb-master2:/mnt/data0/
+
+  yb-master3:
+    image: yugabytedb/yugabyte:latest
+    command:
+    - "/home/yugabyte/bin/yb-master"
+    - "--fs_data_dirs=/mnt/data0"
+    - "--master_addresses=tasks.yb-master1:7100,tasks.yb-master2:7100,tasks.yb-master3:7100"
+    - "--rpc_bind_addresses=0.0.0.0:7100"
+    - "--replication_factor=3"
+    networks:
+    - yugabytedb
+    volumes:
+    - yb-master3:/mnt/data0/
+
+  yb-tserver:
+    image: yugabytedb/yugabyte:latest
+    command:
+    - "/home/yugabyte/bin/yb-tserver"
+    - "--fs_data_dirs=/mnt/data0"
+    - "--tserver_master_addrs=tasks.yb-master1:7100,tasks.yb-master2:7100,tasks.yb-master3:7100"
+    - "--rpc_bind_addresses=0.0.0.0:9100"
+    - "--tserver_master_replication_factor=3"
+    deploy:
+      mode: global
+    networks:
+    - yugabytedb
+    ports:
+    - 9000:9000
+    volumes:
+    - yb-tserver:/mnt/data0/
+
+volumes:
+  yb-master1:
+  yb-master2:
+  yb-master3:
+  yb-tserver:
+```
+
+#### Start the cluster
+
+```sh
+$ docker stack deploy --compose-file docker-stack.yml ybstack
+```
+
+- Run the command below to see the services that are now live.
+
+```sh
+$ docker service ls
+```
+
+```sh
+ID                  NAME                 MODE                REPLICAS            IMAGE                        PORTS
+w51jaaitddwl        ybstack_yb-master1   replicated          1/1                 yugabytedb/yugabyte:latest   *:7000->7000/tcp
+u314ns3pgbbk        ybstack_yb-master2   replicated          1/1                 yugabytedb/yugabyte:latest
+5waxekfwdu8n        ybstack_yb-master3   replicated          1/1                 yugabytedb/yugabyte:latest
+sj4lj7sokgzj        ybstack_yb-tserver   global              3/3                 yugabytedb/yugabyte:latest   *:9000->9000/tcp
+```
+
+## 3. Test the APIs
 
 ### YSQL API
 
@@ -310,7 +421,7 @@ I0515 19:54:48.953572    39 yb-admin_client.cc:440] Table 'system_redis.redis' c
 
 - Follow the test instructions as noted in [Quick Start](../../../yedis/quick-start/).
 
-## 6. Test fault-tolerance with node failure
+## 4. Test fault-tolerance with node failure
 
 Docker Swarm ensures that the yb-tserver `global` service will always have 1 yb-tserver container running on every node. If the yb-tserver container on any node dies, then Docker Swarm will bring it back on.
 
@@ -320,7 +431,7 @@ $ docker kill <ybtserver_container_id>
 
 Observe the output of `docker ps` every few seconds till you see that the yb-tserver container is re-spawned by Docker Swarm.
 
-## 7. Test auto-scaling with node addition
+## 5. Test auto-scaling with node addition
 
 - On the host machine, get worker token for new worker nodes to use to join the existing swarm.
 
@@ -369,7 +480,13 @@ ah6wfodd4noh        yb-master3          replicated          1/1                 
 n6padh2oqjk7        yb-tserver          global              4/4                 yugabytedb/yugabyte:latest   *:9000->9000/tcp
 ```
 
-## 8. Remove services and destroy nodes
+## 6. Remove services and destroy nodes
+
+- Remove the services
+
+```sh
+$ docker service rm $(docker service ls -q)
+```
 
 - Stop the machines.
 
