@@ -86,6 +86,11 @@ DEFAULT_YSQL_PORT = 5433
 DEFAULT_YCQL_PORT = 9042
 DEFAULT_WEBSERVER_PORT = 7200
 DEFAULT_CALLHOME = True
+DEFAULT_YSQL_USER = "yugabyte"
+DEFAULT_YSQL_PASSWORD = "yugabyte"
+DEFAULT_YSQL_DB = "yugabyte"
+DEFAULT_YCQL_USER = "cassandra"
+DEFAULT_YCQL_PASSWORD = "cassandra"
 VERSION_METADATA_PATH = os.path.join(YUGABYTE_DIR, "version_metadata.json")
 YUGABYTE_API_CLIENT_PROGRAMS = {
     "ysql": "ysqlsh",
@@ -236,12 +241,8 @@ class ControlScript(object):
         if self.get_failed_node_processes():
             Output.log_error_and_exit(
                 "{} is not running. Cannot connect to YCQL.".format(SCRIPT_NAME))
-        path = os.path.join(BIN_DIR, YUGABYTE_API_CLIENT_PROGRAMS["ycql"])
-        cmd = [
-            path, self.advertise_ip(),
-            str(self.configs.saved_data.get("ycql_port"))
-        ]
-        os.execv(path, cmd)
+        ycql_proxy = YcqlProxy(ip=self.advertise_ip(), port=self.configs.saved_data.get("ycql_port"))
+        ycql_proxy.connect()
 
     # Creates demo database and starts an interactive shell into it. Destroys the sample database
     # after shell quits.
@@ -407,6 +408,11 @@ class ControlScript(object):
         if join_ip:
             master_addresses  = "{}:{},{}".format(join_ip, master_rpc_port, master_addresses)
         tserver_rpc_port = self.configs.saved_data.get("tserver_rpc_port")
+        ysql_user = os.environ.get('YSQL_USER')
+        ysql_password = os.environ.get('YSQL_PASSWORD')
+        ysql_db = os.environ.get('YSQL_DB')
+        ycql_user = os.environ.get('YCQL_USER')
+        ycql_password = os.environ.get('YCQL_PASSWORD')
 
         common_gflags = [
             "--stop_on_parent_termination",
@@ -464,6 +470,12 @@ class ControlScript(object):
                 "--instance_uuid_override={}".format(self.configs.saved_data.get("tserver_uuid")),
                 "--start_redis_proxy=false",
             ]
+
+        if ysql_db is not None or ysql_user is not None or ysql_password is not None:
+            yb_tserver_cmd.extend(["--ysql_enable_auth=true"])
+
+        if ycql_user is not None or ycql_password is not None:
+            yb_tserver_cmd.extend(["--use_cassandra_authentication=true"])
 
         if self.configs.saved_data.get("tserver_flags"):
             yb_tserver_cmd.extend(
@@ -565,6 +577,26 @@ class ControlScript(object):
             if self.configs.temp_data.get("ui"):
                 (_, was_started) = self.maybe_start_yw(is_first_run, is_first_install)
                 should_callhome = should_callhome or was_started
+
+            if is_first_install:
+                if self.get_failed_node_processes():
+                    Output.log_error_and_exit(
+                        "{} is not running.".format(SCRIPT_NAME))
+
+                if ysql_db is not None or ysql_user is not None or ysql_password is not None:
+                    ysql_proxy = YsqlProxy(port=self.configs.saved_data.get("ysql_port"),
+                                    use_env_credentials=False)
+                    if retry_op(ysql_proxy.is_ysql_up):
+                        Output.log("Setting up custom credentials for YSQL...")
+                        setup_env_vars(ysql_proxy, ysql_user, ysql_password, ysql_db)
+
+                if ycql_user is not None or ycql_password is not None:
+                    ycql_proxy = YcqlProxy(ip=self.advertise_ip(),
+                                    port=self.configs.saved_data.get("ycql_port"),
+                                    use_env_credentials=False)
+                    if retry_op(ycql_proxy.is_ycql_up):
+                        Output.log("Setting up custom credentials for YCQL...")
+                        setup_env_vars(ycql_proxy, ycql_user, ycql_password)
 
             if is_first_run:
                 status = self.get_status_string() + \
@@ -976,10 +1008,17 @@ class ControlScript(object):
         if advertise_ip != IP_LOCALHOST or ycql_port != DEFAULT_YCQL_PORT:
             cql_hostname_param =  advertise_ip
             cql_port_param = str(ycql_port)
+        ycql_username = os.getenv('YCQL_USER', DEFAULT_YCQL_USER)
+        ycql_password = os.getenv('YCQL_PASSWORD', os.getenv('YCQL_USER', DEFAULT_YCQL_USER))
 
         ysql_hostname_param = "-h {}".format(advertise_ip) if advertise_ip != IP_LOCALHOST else ""
         ysql_port = self.configs.saved_data.get("ysql_port")
         ysql_port_param = "-p {}".format(ysql_port) if ysql_port != DEFAULT_YSQL_PORT else ""
+        ysql_username = os.getenv('YSQL_USER', DEFAULT_YSQL_USER)
+        ysql_password = os.environ['YSQL_PASSWORD'] if os.environ.get('YSQL_PASSWORD') is \
+                                not None else os.getenv('YSQL_PASSWORD', DEFAULT_YSQL_PASSWORD)
+        ysql_db = os.environ['YSQL_DB'] if os.environ.get('YSQL_DB') is not None else (
+                        os.getenv('YSQL_USER', DEFAULT_YSQL_PASSWORD))
 
         # Make sure ascii escape characters for color encoding do not count towards char limit.
         if self.get_failed_node_processes():
@@ -992,8 +1031,8 @@ class ControlScript(object):
             status = "Running"
 
 
-        ysql_flags = " {} {}".format(ysql_hostname_param, ysql_port_param)
-        ycql_flags = " {} {}".format(cql_hostname_param, cql_port_param)
+        ysql_flags = " {} {} -U {} -d {}".format(ysql_hostname_param, ysql_port_param, ysql_username, ysql_db)
+        ycql_flags = " {} {} -u {} -p {}".format(cql_hostname_param, cql_port_param, ycql_username, ycql_password)
 
         # TODO: Check if YW is disabled. This could be from saving --ui flag, checking PID,
         # or some other method. The first is not preferred because it would deviate from how the
@@ -1015,8 +1054,8 @@ class ControlScript(object):
 
         status_info += [
             (Output.make_yellow("JDBC"),
-               "jdbc:postgresql://{}:{}/yugabyte?user=yugabyte&password=yugabyte".format(
-                advertise_ip, ysql_port)),
+               "jdbc:postgresql://{}:{}/{}?user={}&password={}".format(
+                advertise_ip, ysql_port, ysql_db, ysql_username, ysql_password)),
             (Output.make_yellow("YSQL"), "bin/ysqlsh{}".format(ysql_flags)),
             (Output.make_yellow("YCQL"), "bin/ycqlsh{}".format(ycql_flags)),
             (Output.make_yellow("Data Dir"), self.configs.saved_data.get("data_dir")),
@@ -1769,16 +1808,27 @@ class YBAdminProxy(object):
 
 # Proxy for ysqlsh commands.
 class YsqlProxy(object):
-    def __init__(self, port, path=os.path.join(BIN_DIR, YUGABYTE_API_CLIENT_PROGRAMS["ysql"])):
+    def __init__(self, port, path=os.path.join(BIN_DIR, YUGABYTE_API_CLIENT_PROGRAMS["ysql"]),
+                    use_env_credentials=True):
         self.port = str(port)
         self.path = path
+        if use_env_credentials:
+            self.username = os.getenv('YSQL_USER', DEFAULT_YSQL_USER)
+            self.password = os.environ['YSQL_PASSWORD'] if os.environ.get('YSQL_PASSWORD') is \
+                                not None else os.getenv('YSQL_PASSWORD', DEFAULT_YSQL_PASSWORD)
+            self.db = os.environ['YSQL_DB'] if os.environ.get('YSQL_DB') is not None else (
+                        os.getenv('YSQL_USER', DEFAULT_YSQL_PASSWORD))
+        else:
+            self.username = DEFAULT_YSQL_USER
+            self.password = DEFAULT_YSQL_PASSWORD
+            self.db = DEFAULT_YSQL_DB
 
     # Starts interactive YSQL shell.
     def connect(self, db=None):
-        cmd = [self.path, "-p", self.port]
-        if db:
-            cmd.extend(["-d", db])
-        shell = subprocess.Popen(cmd)
+        if db is None:
+            db = self.db
+        cmd = [self.path, "-p", self.port, "-d", db]
+        shell = subprocess.Popen(cmd, env={"PGUSER": self.username})
         shell.communicate()
 
     # Checks if db exists.
@@ -1786,21 +1836,24 @@ class YsqlProxy(object):
     def db_exists(self, db):
         cmd = [self.path, "-p", self.port, "-q", "-c", "\\t", "-c",
             "select datname from pg_catalog.pg_database where datname='{}'".format(db)]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
         out, err = p.communicate()
         return out.strip() == db
 
     # Creates specified db.
     def create_db(self, db):
         cmd = [self.path, "-p", self.port, "-c", "create database {}".format(db)]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
         out, err = p.communicate()
         return out, err
 
     # Deletes specified db.
     def drop_db(self, db):
         cmd = [self.path, "-p", self.port, "-c", "drop database {}".format(db)]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
         out, err = p.communicate()
         return out, err
 
@@ -1811,10 +1864,136 @@ class YsqlProxy(object):
             cmd.extend(["-d", db])
         for path in filepaths:
             cmd.extend(["-f", path])
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password})
+        out, err = p.communicate()
+        return out, err
+
+    # Check user exists
+    # Note that this will return false if ysqlsh can't connect, even if user exists.
+    def user_exists(self, ysql_username):
+        cmd = [self.path, "-p", self.port, "-c",
+            "select rolname from pg_catalog.pg_roles where rolname='{}'".format(ysql_username)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
+        out, err = p.communicate()
+        return out.strip() == ysql_username
+
+    # Create specified superuser
+    def create_user(self, ysql_username, ysql_password):
+        cmd = [self.path, "-p", self.port, "-c",
+                "create role {} with LOGIN SUPERUSER password '{}';".
+                format(ysql_username, ysql_password)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
+        out, err = p.communicate()
+        return out, err
+
+    # Delete specified user
+    def delete_user(self, username, password, user_to_delete=DEFAULT_YSQL_USER):
+        cmd = [self.path, "-p", self.port, "-c", "drop role {};".format(user_to_delete)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": username, "PGPASSWORD": password, "PGDATABASE": self.db})
+        out, err = p.communicate()
+        return out, err 
+    
+    # Update specified user's password
+    def update_password(self, new_password, user_to_update=DEFAULT_YSQL_USER):
+        cmd = [self.path, "-p", self.port, "-c",
+                "alter role {} password '{}';".format(user_to_update, new_password)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
+        out, err = p.communicate()
+        return out, err
+
+    # Change specified DB's owner
+    def db_owner(self, db, new_owner):
+        cmd = [self.path, "-p", self.port, "-c",
+                "alter database {} owner to {};".format(db, new_owner)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password, "PGDATABASE": self.db})
+        out, err = p.communicate()
+        return out, err
+
+    # Check YSQL is UP
+    def is_ysql_up(self):
+        cmd = [self.path, "-p", self.port, "-c", "\\conninfo"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PGUSER": self.username, "PGPASSWORD": self.password})
+        out, err = p.communicate()
+        if err:
+            Output.log("Unable to connect using YSQL. Error: {}".format(err))
+            raise RetryableError()
+        else:
+            Output.log("YSQL Connection Info - {}".format(out))
+            return True
+
+# Proxy for ycqlsh commands.
+class YcqlProxy(object):
+    def __init__(self, ip, port, path=os.path.join(BIN_DIR, YUGABYTE_API_CLIENT_PROGRAMS["ycql"]),
+                    use_env_credentials=True):
+        self.ip = str(ip)
+        self.port = str(port)
+        self.path = path
+        if use_env_credentials:
+            self.username = os.getenv('YCQL_USER', DEFAULT_YCQL_USER)
+            self.password = os.environ['YCQL_PASSWORD'] if os.environ.get('YCQL_PASSWORD') is \
+                                not None else os.getenv('YCQL_PASSWORD', DEFAULT_YCQL_PASSWORD)
+        else:
+            self.username = DEFAULT_YCQL_USER
+            self.password = DEFAULT_YCQL_PASSWORD
+
+    # Starts interactive YCQL shell.
+    def connect(self):
+        cmd = [self.path, self.ip, self.port, "-u", self.username]
+        shell = subprocess.Popen(cmd)
+        shell.communicate()
+
+    # Check user exists
+    # Note that this will return false if ycqlsh can't connect, even if user exists.
+    def user_exists(self, ycql_username):
+        cmd = [self.path, self.ip, self.port, "-u", self.username, "-p", self.password, "--execute",
+            "SELECT role FROM system_auth.roles WHERE role='{}';".format(ycql_username)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = p.communicate()
+        return out.strip() == ycql_username
+
+    # Create specified superuser
+    def create_user(self, ycql_username, ycql_password):
+        cmd = [self.path, self.ip, self.port, "-u", self.username, "-p", self.password, "-e",
+                "CREATE ROLE {} WITH PASSWORD = '{}' AND LOGIN = true AND SUPERUSER = true;".
+                format(ycql_username, ycql_password)]
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = p.communicate()
         return out, err
 
+    # Delete specified user
+    def delete_user(self, username, password, user_to_delete=DEFAULT_YCQL_USER):
+        cmd = [self.path, self.ip, self.port, "-u", username, "-p", password, "-e",
+                "DROP ROLE IF EXISTS {};".format(user_to_delete)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = p.communicate()
+        return out, err 
+    
+    # Update specified user's password
+    def update_password(self, new_password, user_to_update=DEFAULT_YCQL_USER):
+        cmd = [self.path, self.ip, self.port, "-u", self.username, "-p", self.password, "-e",
+                "ALTER ROLE {} WITH PASSWORD = '{}';".format(user_to_update, new_password)]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = p.communicate()
+        return out, err
+
+    # Check YSQL is UP
+    def is_ycql_up(self):
+        cmd = [self.path, self.ip, self.port, "-u", self.username, "-p", self.password, "-e", "SHOW HOST"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = p.communicate()
+        if err:
+            Output.log("Unable to connect using YCQL. Error: {}".format(err))
+            raise RetryableError()
+        else:
+            Output.log("YCQL Connection Info - {}".format(out))
+            return True
 
 # Currently unused. Useful for getting diagnostics that are available only through logs.
 class LogAnalyzer(object):
@@ -2282,6 +2461,58 @@ def retry_op(func, timeout=180):
 
     raise RuntimeError("Failed after retrying operation for {} secs.".format(
         now - start_time))
+
+def setup_env_vars(proxy_class, usr, passwd, db=None):
+    
+    # Create DB 
+    if db is not None and not proxy_class.db_exists(db):
+        Output.log("Creating {} database".format(db))
+        _, err = proxy_class.create_db(db)
+        if err:
+            Output.log_error_and_exit("Failed to create {} database: \
+                {}".format(db, err))
+
+        Output.log("{} database created successfully".format(db))
+
+    # Update password for default user
+    if passwd is not None and usr is None:
+        _, err = proxy_class.update_password(passwd)
+        if err:
+            Output.log_error_and_exit("class: {} Failed to update password for default user {}".
+                format(proxy_class, err))
+
+        Output.log("class: {} Password has updated for default user successfully".
+            format(proxy_class))
+
+    # Create user 
+    if usr is not None and not proxy_class.user_exists(usr):
+        Output.log("Creating {} user".format(usr))
+        _, err = proxy_class.create_user(usr, passwd if passwd is not None else usr)
+        if err:
+            Output.log_error_and_exit("Failed to create {} user: {}".format(usr, err))
+
+        if proxy_class.__class__.__name__ == 'YsqlProxy':
+            if db is None and not proxy_class.db_exists(usr):
+                Output.log("Creating {} database".format(usr))
+                _, err = proxy_class.create_db(usr)
+                if err:
+                    Output.log_error_and_exit("Failed to create {} database: {}".format(usr, err))
+
+                Output.log("{} database created successfully".
+                    format(usr))
+
+            _, err = proxy_class.db_owner(db if db is not None else usr, usr)
+            if err:
+                Output.log_error_and_exit("Failed to change owner on {} database: {}".
+                    format(usr, err))
+
+        _, err = proxy_class.delete_user(usr, passwd if passwd is not None else usr)
+        if err:
+            Output.log_error_and_exit("Failed to delete default user: {}".format(err))
+        
+        Output.log("{} user created successfully".format(usr))
+
+    Output.log("Custom credentials configured successfully")
 
 if __name__ == '__main__':
     ControlScript().run()
