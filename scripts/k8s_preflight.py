@@ -5,6 +5,32 @@ import signal
 import socket
 import sys
 import time
+import resource
+
+# Skipping following resources to verify because
+# python resource module does not have related attriutes.
+# Some of them are available in Python v3 but not all.
+# pipe size, threshold - 8
+# virtual memory, threshold - unlimited (RLIMIT_VMEM)
+# file locks, threshold - unlimited
+# scheduling priority, threshold - 0 (RLIMIT_NICE)
+# pending signals, threshold - 119934, (RLIMIT_SIGPENDING)
+# POSIX message queues, threshold - 819200 (RLIMIT_MSGQUEUE)
+# real-time priority, threshold - 0 (RLIMIT_RTPRIO)
+# As of now, necessary ulimit resources for YB are in verification RLIMIT_NOFILE and RLIMIT_NPROC
+# Ref - https://docs.yugabyte.com/preview/deploy/manual-deployment/system-config/#ulimits
+
+RECOMMEDED_RESOURCES = {
+    "RLIMIT_DATA": (-1, "data seg size"),
+    "RLIMIT_MEMLOCK": (64, "max locked memory"),
+    "RLIMIT_AS": (-1, "max memory size"),
+    "RLIMIT_STACK": (8192, "stack size"),
+    "RLIMIT_CORE": (-1, "core file size"),
+    "RLIMIT_FSIZE": (-1, "file size"),
+    "RLIMIT_NOFILE": (1048576, "open files"),
+    "RLIMIT_CPU": (-1, "cpu time"),
+    "RLIMIT_NPROC": (12000, "max user processes"),
+}
 
 
 def wait_for_dns_resolve(addr):
@@ -62,7 +88,7 @@ def wait_for_bind(addr, port):
 
 
 def parse_addr(addr):
-    num_colons = addr.count(':')
+    num_colons = addr.count(":")
     if num_colons == 0:
         # If no colons exist, return address.
         # Examples:
@@ -74,11 +100,11 @@ def parse_addr(addr):
         # Examples:
         #   1.2.3.4:567 -> 1.2.3.4
         #   foo.com:123 -> foo.com
-        return addr.split(':')[0]
+        return addr.split(":")[0]
     else:
         # If >1 colon exists, parse ipv6 address.
-        left_pos = addr.find('[')
-        right_pos = addr.find(']')
+        left_pos = addr.find("[")
+        right_pos = addr.find("]")
         if left_pos != -1 and right_pos != -1:
             # If left and right brackets exist, return inner portion.
             # Examples:
@@ -93,12 +119,64 @@ def parse_addr(addr):
             return addr
 
 
+def verify_ulimit(ulimit):
+    missed_ulimits_mandatory = []
+    missed_ulimits_optional = []
+    alert_template = "{}\n\t| Expected Value - {}\t\t| Current Value - {}"
+
+    for ulimit_resource, (threshold, resource_name) in RECOMMEDED_RESOURCES.items():
+        soft_limit, _ = resource.getrlimit(getattr(resource, ulimit_resource))
+
+        if soft_limit != threshold and soft_limit != -1:
+            if resource_name in ["open files", "max user processes"]:
+                if soft_limit < threshold:
+                    missed_ulimits_mandatory.append(
+                        alert_template.format(
+                            resource_name, str(threshold), str(soft_limit)
+                        )
+                    )
+
+            elif resource_name in [
+                "data seg size",
+                "max locked memory",
+                "max memory size",
+                "stack size",
+            ]:
+                if int(soft_limit / 1024) != threshold:
+                    missed_ulimits_optional.append(
+                        alert_template.format(
+                            resource_name, str(threshold), str(int(soft_limit / 1024))
+                        )
+                    )
+
+            else:
+                missed_ulimits_optional.append(
+                    alert_template.format(
+                        resource_name, str(threshold), str(soft_limit)
+                    )
+                )
+
+    if len(missed_ulimits_mandatory) > 0:
+        print(
+            "Following mandatory resource values not as per the recommendations - \n"
+            + "\n".join(missed_ulimits_mandatory)
+        )
+        exit(1)
+
+    if len(missed_ulimits_optional) > 0:
+        print(
+            "Following optional resource values not as per the recommendations - \n"
+            + "\n".join(missed_ulimits_optional)
+        )
+
+
 if __name__ == "__main__":
     # Parse CLI args.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--addr", action="append", required=True)
+    parser.add_argument("--addr", action="append")
+    parser.add_argument("--skip_ulimit", action="store_const", const=True)
     parser.add_argument("--timeout", type=int, default=300)  # 300 seconds = 5 minutes
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--port", type=int, action="append")
     group.add_argument("--skip_bind", action="store_const", const=True)
     args = parser.parse_args()
@@ -108,10 +186,15 @@ if __name__ == "__main__":
     signal.alarm(args.timeout)
 
     # Perform preflight checks.
-    for addr in args.addr:
-        addr = parse_addr(addr)
-        wait_for_dns_resolve(addr)
-        if args.skip_bind:
-            continue
-        for port in args.port:
-            wait_for_bind(addr, port)
+    if args.addr is not None:
+        for addr in args.addr:
+            addr = parse_addr(addr)
+            wait_for_dns_resolve(addr)
+            if args.skip_bind:
+                continue
+            for port in args.port:
+                wait_for_bind(addr, port)
+
+    # Perform ulimit verification
+    if not args.skip_ulimit:
+        verify_ulimit(RECOMMEDED_RESOURCES)
