@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from __future__ import print_function
 import argparse
 import signal
 import socket
@@ -20,16 +21,19 @@ import resource
 # As of now, necessary ulimit resources for YB are in verification RLIMIT_NOFILE and RLIMIT_NPROC
 # Ref - https://docs.yugabyte.com/preview/deploy/manual-deployment/system-config/#ulimits
 
-RECOMMEDED_RESOURCES = {
+REQUIRED_RESOURCES = {
+    "RLIMIT_NOFILE": (1048576, "open files"),
+    "RLIMIT_NPROC": (12000, "max user processes"),
+}
+
+OPTIONAL_RESOURCES = {
     "RLIMIT_DATA": (-1, "data seg size"),
-    "RLIMIT_MEMLOCK": (64, "max locked memory"),
+    "RLIMIT_MEMLOCK": (65536, "max locked memory"),  # 64 kbytes, 65536 bytes
     "RLIMIT_AS": (-1, "max memory size"),
-    "RLIMIT_STACK": (8192, "stack size"),
+    "RLIMIT_STACK": (8388608, "stack size"),  # 8192 kbytes, 8388608 bytes
     "RLIMIT_CORE": (-1, "core file size"),
     "RLIMIT_FSIZE": (-1, "file size"),
-    "RLIMIT_NOFILE": (1048576, "open files"),
     "RLIMIT_CPU": (-1, "cpu time"),
-    "RLIMIT_NPROC": (12000, "max user processes"),
 }
 
 
@@ -119,82 +123,95 @@ def parse_addr(addr):
             return addr
 
 
-def verify_ulimit(ulimit):
-    missed_ulimits_mandatory = []
-    missed_ulimits_optional = []
-    alert_template = "{}\n\t| Expected Value - {}\t\t| Current Value - {}"
+def verify_ulimit(ulimit, missed_ulimit):
+    alert_template = "{}\n\t| Expected Value : {}\t\t| Current Value : {}"
 
-    for ulimit_resource, (threshold, resource_name) in RECOMMEDED_RESOURCES.items():
+    for ulimit_resource, (threshold, resource_name) in ulimit.items():
         soft_limit, _ = resource.getrlimit(getattr(resource, ulimit_resource))
 
-        if soft_limit != threshold and soft_limit != -1:
-            if resource_name in ["open files", "max user processes"]:
-                if soft_limit < threshold:
-                    missed_ulimits_mandatory.append(
-                        alert_template.format(
-                            resource_name, str(threshold), str(soft_limit)
-                        )
-                    )
-
-            elif resource_name in [
-                "data seg size",
-                "max locked memory",
-                "max memory size",
-                "stack size",
-            ]:
-                if int(soft_limit / 1024) != threshold:
-                    missed_ulimits_optional.append(
-                        alert_template.format(
-                            resource_name, str(threshold), str(int(soft_limit / 1024))
-                        )
-                    )
-
-            else:
-                missed_ulimits_optional.append(
+        # Cover all the cases where threshold equals to -1 and
+        # soft limit set to some value. -1 means unlimited.
+        if threshold == -1:
+            if soft_limit != threshold:
+                missed_ulimit.append(
                     alert_template.format(
                         resource_name, str(threshold), str(soft_limit)
                     )
                 )
-
-    if len(missed_ulimits_mandatory) > 0:
-        print(
-            "Following mandatory resource values not as per the recommendations - \n"
-            + "\n".join(missed_ulimits_mandatory)
-        )
-        exit(1)
-
-    if len(missed_ulimits_optional) > 0:
-        print(
-            "Following optional resource values not as per the recommendations - \n"
-            + "\n".join(missed_ulimits_optional)
-        )
+        # Cover all the cases where threshold set to some value and
+        # soft limit set to some other lower value and soft limit
+        # should be some arbitrary value not -1.
+        # Ex- max user processes - threshold 12000 and few cloud
+        # provider set it to -1.
+        elif soft_limit < threshold and soft_limit != -1:
+            missed_ulimit.append(
+                alert_template.format(resource_name, str(threshold), str(soft_limit))
+            )
 
 
 if __name__ == "__main__":
     # Parse CLI args.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--addr", action="append")
-    parser.add_argument("--skip_ulimit", action="store_const", const=True)
+    subparser = parser.add_subparsers(dest="preflight_check")
+
     parser.add_argument("--timeout", type=int, default=300)  # 300 seconds = 5 minutes
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--port", type=int, action="append")
-    group.add_argument("--skip_bind", action="store_const", const=True)
+
+    # Common Subparser
+    # 1. Ulimit preflight
+    subparser_common = subparser.add_parser(
+        "all", help="All Preflight Checks except dnscheck"
+    )
+    subparser_common.add_argument(
+        "--skip_ulimit", action="store_const", const=True, help="Skip Ulimit"
+    )
+
+    # DNS Preflight
+    subparser_dnscheck = subparser.add_parser("dnscheck", help="DNS Preflight")
+    subparser_dnscheck.add_argument(
+        "--addr", action="append", required=True, help="Address to check"
+    )
+    group = subparser_dnscheck.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--port", type=int, action="append", help="Port used to check bind"
+    )
+    group.add_argument(
+        "--skip_bind", action="store_const", const=True, help="Skip port binding"
+    )
+
     args = parser.parse_args()
 
     # Setup script timeout.
     signal.signal(signal.SIGALRM, lambda *_: sys.exit("Error: Timeout"))
     signal.alarm(args.timeout)
 
-    # Perform preflight checks.
-    if args.addr is not None:
-        for addr in args.addr:
-            addr = parse_addr(addr)
-            wait_for_dns_resolve(addr)
-            if args.skip_bind:
-                continue
-            for port in args.port:
-                wait_for_bind(addr, port)
+    if args.preflight_check == "dnscheck":
+        # Perform preflight checks.
+        if args.addr is not None:
+            for addr in args.addr:
+                addr = parse_addr(addr)
+                wait_for_dns_resolve(addr)
+                if args.skip_bind:
+                    continue
+                for port in args.port:
+                    wait_for_bind(addr, port)
+    elif args.preflight_check == "all":
+        # Perform ulimit verification
+        if not args.skip_ulimit:
+            ALERT_MESSAGE = """{} ulimit values too low, see below. In kubernetes,
+set the helm override 'preflightCheck.skipUlimit: false'
+to override this check"""
+            missed_ulimits_mandatory = [ALERT_MESSAGE.format("Required")]
+            missed_ulimits_optional = [ALERT_MESSAGE.format("Optional")]
 
-    # Perform ulimit verification
-    if not args.skip_ulimit:
-        verify_ulimit(RECOMMEDED_RESOURCES)
+            for ulimit_list, missing_ulimit, action in (
+                OPTIONAL_RESOURCES,
+                missed_ulimits_optional,
+                0,
+            ), (REQUIRED_RESOURCES, missed_ulimits_mandatory, 1):
+                verify_ulimit(ulimit_list, missing_ulimit)
+
+                if len(missing_ulimit) > 1:
+                    print(str("\n".join(missing_ulimit)), file=sys.stderr)
+
+                    if action:
+                        sys.exit(action)
