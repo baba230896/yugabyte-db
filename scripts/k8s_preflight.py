@@ -123,8 +123,8 @@ def parse_addr(addr):
             return addr
 
 
-def verify_ulimit(ulimit, missed_ulimit):
-    alert_template = "{}\n\t| Expected Value : {}\t\t| Current Value : {}"
+def verify_ulimit(ulimit, alert_msgs):
+    alert_template = "{} | Expected Value : {} | Current Value : {}"
 
     for ulimit_resource, (threshold, resource_name) in ulimit.items():
         soft_limit, _ = resource.getrlimit(getattr(resource, ulimit_resource))
@@ -133,7 +133,7 @@ def verify_ulimit(ulimit, missed_ulimit):
         # soft limit set to some value. -1 means unlimited.
         if threshold == -1:
             if soft_limit != threshold:
-                missed_ulimit.append(
+                alert_msgs.append(
                     alert_template.format(
                         resource_name, str(threshold), str(soft_limit)
                     )
@@ -144,7 +144,7 @@ def verify_ulimit(ulimit, missed_ulimit):
         # Ex- max user processes - threshold 12000 and few cloud
         # provider set it to -1.
         elif soft_limit < threshold and soft_limit != -1:
-            missed_ulimit.append(
+            alert_msgs.append(
                 alert_template.format(resource_name, str(threshold), str(soft_limit))
             )
 
@@ -159,7 +159,7 @@ if __name__ == "__main__":
     # Common Subparser
     # 1. Ulimit preflight
     subparser_common = subparser.add_parser(
-        "all", help="All Preflight Checks except dnscheck"
+        "all", help="All preflight checks except dnscheck"
     )
     subparser_common.add_argument(
         "--skip_ulimit", action="store_const", const=True, help="Skip Ulimit"
@@ -185,33 +185,32 @@ if __name__ == "__main__":
     signal.alarm(args.timeout)
 
     if args.preflight_check == "dnscheck":
-        # Perform preflight checks.
-        if args.addr is not None:
-            for addr in args.addr:
-                addr = parse_addr(addr)
-                wait_for_dns_resolve(addr)
-                if args.skip_bind:
-                    continue
-                for port in args.port:
-                    wait_for_bind(addr, port)
+        # Perform dns preflight checks.
+        for addr in args.addr:
+            addr = parse_addr(addr)
+            wait_for_dns_resolve(addr)
+            if args.skip_bind:
+                continue
+            for port in args.port:
+                wait_for_bind(addr, port)
     elif args.preflight_check == "all":
         # Perform ulimit verification
         if not args.skip_ulimit:
-            ALERT_MESSAGE = """{} ulimit values too low, see below. In kubernetes,
-set the helm override 'preflightCheck.skipUlimit: false'
-to override this check"""
-            missed_ulimits_mandatory = [ALERT_MESSAGE.format("Required")]
-            missed_ulimits_optional = [ALERT_MESSAGE.format("Optional")]
+            ALERT_MESSAGE = str("{} ulimit values too low, see below. In kubernetes"
+                                + "set the helm override 'preflight.skipUlimit: false'"
+                                + "to override this check")
+            mandatory_missed_ulimits = [ALERT_MESSAGE.format("Required")]
+            optional_missed_ulimits = [ALERT_MESSAGE.format("Optional")]
 
-            for ulimit_list, missing_ulimit, action in (
+            for ulimit_list, alert_messages, exit_action in (
                 OPTIONAL_RESOURCES,
-                missed_ulimits_optional,
-                0,
-            ), (REQUIRED_RESOURCES, missed_ulimits_mandatory, 1):
-                verify_ulimit(ulimit_list, missing_ulimit)
+                optional_missed_ulimits,
+                False,
+            ), (REQUIRED_RESOURCES, mandatory_missed_ulimits, True):
+                verify_ulimit(ulimit_list, alert_messages)
 
-                if len(missing_ulimit) > 1:
-                    print(str("\n".join(missing_ulimit)), file=sys.stderr)
+                if len(alert_messages) > 1:
+                    print(str("\n".join(alert_messages)), file=sys.stderr)
 
-                    if action:
-                        sys.exit(action)
+                    if exit_action:
+                        sys.exit(1)
